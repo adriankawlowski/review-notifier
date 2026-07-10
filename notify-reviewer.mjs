@@ -8,10 +8,18 @@ const SLACK_USER_ID = process.env.SLACK_USER_ID;
 const STATE_FILE = 'notified-mrs.json';
 
 async function getOpenReviewRequests() {
-  const url = `${GITLAB_BASE_URL}/api/v4/merge_requests?reviewer_username=${GITLAB_USERNAME}&state=opened&scope=all&per_page=100`;
-  const res = await fetch(url, { headers: { 'PRIVATE-TOKEN': GITLAB_TOKEN } });
-  if (!res.ok) throw new Error(`GitLab API error: ${res.status} ${await res.text()}`);
-  return res.json();
+  const mrs = [];
+  let page = 1;
+  for (;;) {
+    const url = `${GITLAB_BASE_URL}/api/v4/merge_requests?reviewer_username=${GITLAB_USERNAME}&state=opened&scope=all&per_page=100&page=${page}`;
+    const res = await fetch(url, { headers: { 'PRIVATE-TOKEN': GITLAB_TOKEN } });
+    if (!res.ok) throw new Error(`GitLab API error: ${res.status} ${await res.text()}`);
+    const batch = await res.json();
+    mrs.push(...batch);
+    if (batch.length < 100) break;
+    page++;
+  }
+  return mrs;
 }
 
 async function sendSlackDM(text) {
@@ -28,12 +36,24 @@ const loadState = () => (existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_
 const saveState = (ids) => writeFileSync(STATE_FILE, JSON.stringify(ids, null, 2));
 
 const mrs = await getOpenReviewRequests();
-const notified = loadState();
-const newMrs = mrs.filter((mr) => !notified.includes(mr.id));
+const currentIds = new Set(mrs.map((mr) => mr.id));
+const notified = new Set(loadState().filter((id) => currentIds.has(id)));
+const newMrs = mrs.filter((mr) => !notified.has(mr.id));
 
+let failures = 0;
 for (const mr of newMrs) {
-  await sendSlackDM(`:eyes: You were requested as a reviewer on *${mr.title}*\n${mr.web_url}`);
-  console.log(`Notified for MR #${mr.iid}: ${mr.title}`);
+  if (notified.has(mr.id)) continue;
+  try {
+    await sendSlackDM(`:eyes: You were requested as a reviewer on *${mr.title}*\n${mr.web_url}`);
+    console.log(`Notified for MR #${mr.iid}: ${mr.title}`);
+    notified.add(mr.id);
+    saveState([...notified]);
+  } catch (err) {
+    failures++;
+    console.error(`Failed to notify for MR #${mr.iid}: ${mr.title}`, err);
+  }
 }
 
-saveState(mrs.map((mr) => mr.id));
+saveState([...notified]);
+
+if (failures > 0) process.exitCode = 1;
